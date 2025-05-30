@@ -137,6 +137,421 @@ def run_all_parallel(
 DEFAULT_LINELIST = ["Lya", "OII", "Hb", "OIII", "Ha", "Ha+NII", "SII", "SIII"]
 
 
+def _run_all_stack_p_a_1d(id, **kwargs):
+    """
+    Execute the 'stack_p_a_1d' fitting strategy.
+    This strategy loads beam data, groups them by PA, creates 2D stacks for each PA,
+    extracts 1D spectra, combines them, fits for redshift, line properties,
+    and saves standard output FITS files.
+    """
+    import glob
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import os
+    import scipy.optimize
+    from collections import OrderedDict
+    from astropy.table import Table
+    import astropy.units as u
+    import astropy.io.fits as pyfits 
+    from . import utils 
+    from .multifit import MultiBeam 
+    from .stack import StackedSpectrum
+    from .pipeline import summary 
+    from .version import __version__ as grizli_version
+
+    # Matplotlib imports for the new plotting function
+    import matplotlib.gridspec
+    # pyplot is already imported globally as plt
+
+    # IGM and PLINE are globals in this file, should be accessible.
+
+    # Unpack relevant arguments from kwargs
+    group_name = kwargs.get('group_name', 'grism')
+    root = kwargs.get('root', '*')
+    file_pattern = kwargs.get('file_pattern', '{root}_{id:05d}')
+    fcontam = kwargs.get('fcontam', 0.2)
+    MW_EBV = kwargs.get('MW_EBV', 0.0)
+    sys_err = kwargs.get('sys_err', 0.02) 
+    verbose = kwargs.get('verbose', True)
+    use_psf = kwargs.get('use_psf', False)
+    min_mask = kwargs.get('min_mask', 0.01)
+    min_sens = kwargs.get('min_sens', 0.02)
+    mask_resid = kwargs.get('mask_resid', True)
+    bad_pa_threshold = kwargs.get('bad_pa_threshold', 1.6)
+    save_figures = kwargs.get('save_figures', True)
+    fig_type = kwargs.get('fig_type', 'png')
+    fwhm = kwargs.get('fwhm', 1200) 
+    pline_params = kwargs.get('pline', PLINE)
+    write_fits_files = kwargs.get('write_fits_files', True)
+
+    zr = kwargs.get('zr', [0.65, 1.6])
+    dz = kwargs.get('dz', [0.004, 0.0002])
+    prior = kwargs.get('prior', None)
+    fitter_types = kwargs.get('fitter', ["nnls", "bounded"]) 
+    if isinstance(fitter_types, str): fitter_types = [fitter_types, fitter_types]
+    huber_delta = kwargs.get('huber_delta', 4)
+    bounded_kwargs = kwargs.get('bounded_kwargs', BOUNDED_DEFAULTS)
+    COEFF_SCALE = 1.0e-19 
+
+    t0 = kwargs.get('t0')
+    if t0 is None: t0 = utils.load_templates(line_complexes=True, fsps_templates=True, fwhm=fwhm)
+    t1 = kwargs.get('t1')
+    if t1 is None: t1 = utils.load_templates(line_complexes=False, fsps_templates=True, fwhm=fwhm)
+
+    filename_base = file_pattern.format(root=root, id=id, group_name=group_name)
+    mb_files = glob.glob(f'{filename_base}.beams.fits')
+    if not mb_files:
+        if verbose: print(f"No beams files found for {filename_base}.beams.fits")
+        return None, None, None, pa_spectra_1d, None # mb not defined yet, pa_spectra_1d is []
+
+    mb = MultiBeam( mb_files, fcontam=fcontam, group_name=group_name, MW_EBV=MW_EBV,
+        sys_err=sys_err, verbose=verbose, psf=use_psf, min_mask=min_mask,
+        min_sens=min_sens, mask_resid=mask_resid)
+
+    if bad_pa_threshold > 0:
+        out = mb.check_for_bad_PAs(chi2_threshold=bad_pa_threshold, poly_order=1, reinit=True, fit_background=True)
+        fit_log, keep_dict, has_bad = out
+        if has_bad and verbose: print(f"\nHas bad PA! Final list: {keep_dict}\n{fit_log}")
+        if has_bad and save_figures:
+            try:
+                _, fig_bad_pa = mb.drizzle_grisms_and_PAs(fcontam=fcontam, flambda=False, kernel="point", size=32, diff=False)
+                fig_bad_pa.savefig(f"{group_name}_{id:05d}.fix.stack.{fig_type}")
+                plt.close(fig_bad_pa)
+            except Exception as e:
+                if verbose: print(f"Failed to save bad PA diagnostic figure: {e}")
+    
+    if verbose: print(f"Initial PA groups for id={id}: {mb.PA}")
+
+    pa_spectra_1d = []
+    for grism_name in mb.PA:
+        for pa_angle_str in mb.PA[grism_name]:
+            pa_angle = float(pa_angle_str)
+            if verbose: print(f"\nProcessing PA: {grism_name} / {pa_angle}")
+            current_pa_info = {'pa_angle': pa_angle, 'grism': grism_name, 'spec_table': None}
+            pa_beam_indices = mb.PA[grism_name][pa_angle_str]
+            pa_beams = [mb.beams[i] for i in pa_beam_indices]
+            if not pa_beams:
+                if verbose: print(f"No beams for PA {grism_name} / {pa_angle}, skipping.")
+                pa_spectra_1d.append(current_pa_info)
+                continue
+            mb_pa_group_name = f"{group_name}_pa_{grism_name}_{int(pa_angle)}"
+            mb_pa = MultiBeam(pa_beams, fcontam=fcontam, group_name=mb_pa_group_name, MW_EBV=MW_EBV,
+                              sys_err=sys_err, verbose=False, psf=use_psf, min_mask=min_mask,
+                              min_sens=min_sens, mask_resid=mask_resid)
+            hdu_pa_stack, temp_fits_file = None, None
+            try:
+                hdu_pa_stack, fig_pa_stack = mb_pa.drizzle_grisms_and_PAs(
+                    fcontam=fcontam, flambda=False, kernel=pline_params.get('kernel', 'point'), 
+                    size=pline_params.get('size', 32), pixfrac=pline_params.get('pixfrac', 0.2), 
+                    scale=pline_params.get('pixscale',0.1), tfit=None)
+                if fig_pa_stack:
+                    if save_figures:
+                        fig_pa_stack.savefig(f"{group_name}_{id:05d}_{grism_name}_{int(pa_angle)}.pa_stack.{fig_type}")
+                    plt.close(fig_pa_stack)
+                if hdu_pa_stack and 'SCI' in hdu_pa_stack and 'WHT' in hdu_pa_stack:
+                    temp_fits_file = f"temp_pa_stack_{id}_{grism_name}_{int(pa_angle)}.fits"
+                    hdu_pa_stack.writeto(temp_fits_file, overwrite=True, output_verify='silentfix')
+                    sci_extver = hdu_pa_stack['SCI'].header.get('EXTVER', grism_name)
+                    stacked_spec_obj = StackedSpectrum(file=temp_fits_file, sys_err=sys_err, mask_min=min_mask, 
+                                                       extver=sci_extver, fcontam=fcontam, MW_EBV=MW_EBV, verbose=False)
+                    spec_1d_pa_tables = stacked_spec_obj.optimal_extract(bin=1)
+                    if len(spec_1d_pa_tables) == 1: current_pa_info['spec_table'] = list(spec_1d_pa_tables.values())[0]
+                    elif sci_extver in spec_1d_pa_tables: current_pa_info['spec_table'] = spec_1d_pa_tables[sci_extver]
+                    elif grism_name in spec_1d_pa_tables: current_pa_info['spec_table'] = spec_1d_pa_tables[grism_name]
+                    elif verbose: print(f"Warning: Could not determine correct key for extracted 1D spectrum. Keys: {spec_1d_pa_tables.keys()}")
+            except Exception as e:
+                if verbose: print(f"Error processing PA {grism_name} / {pa_angle}: {e}")
+            finally:
+                if temp_fits_file and os.path.exists(temp_fits_file): os.remove(temp_fits_file)
+            pa_spectra_1d.append(current_pa_info)
+
+    final_1d_spectrum_table = None
+    valid_pa_spectra = [item for item in pa_spectra_1d if item['spec_table'] is not None and isinstance(item['spec_table'], Table)]
+    if not valid_pa_spectra:
+        if verbose: print(f"No valid 1D PA spectra to combine for id={id}.")
+        return mb, None, None, pa_spectra_1d, None
+    if len(valid_pa_spectra) == 1:
+        final_1d_spectrum_table = valid_pa_spectra[0]['spec_table']
+        if verbose: print(f"\nUsing 1D spectrum from a single PA: {valid_pa_spectra[0]['grism']} / {valid_pa_spectra[0]['pa_angle']}")
+    elif len(valid_pa_spectra) > 1:
+        if verbose: print(f"\nCombining {len(valid_pa_spectra)} PA 1D spectra.")
+        min_wave_val = np.min([np.min(item['spec_table']['wave'].value) for item in valid_pa_spectra])
+        max_wave_val = np.max([np.max(item['spec_table']['wave'].value) for item in valid_pa_spectra])
+        first_wave_array = np.array(valid_pa_spectra[0]['spec_table']['wave'].value)
+        median_log_dz = np.median(np.diff(np.log(first_wave_array)))
+        common_wave_values = utils.log_zgrid([min_wave_val, max_wave_val], median_log_dz)
+        sum_inverse_variance = np.zeros_like(common_wave_values, dtype=float); sum_flux_times_inverse_variance = np.zeros_like(common_wave_values, dtype=float)
+        wave_unit = valid_pa_spectra[0]['spec_table']['wave'].unit if hasattr(valid_pa_spectra[0]['spec_table']['wave'], 'unit') else u.Angstrom
+        flux_unit = valid_pa_spectra[0]['spec_table']['flux'].unit if hasattr(valid_pa_spectra[0]['spec_table']['flux'], 'unit') else (u.erg / u.s / u.cm**2 / u.Angstrom)
+        for pa_spec_item in valid_pa_spectra:
+            current_table = pa_spec_item['spec_table']; current_wave_values = np.array(current_table['wave'].value)
+            interp_flux = np.interp(common_wave_values, current_wave_values, current_table['flux'].value, left=0, right=0)
+            interp_err = np.interp(common_wave_values, current_wave_values, current_table['err'].value, left=np.inf, right=np.inf)
+            interp_variance = interp_err**2; inverse_variance = np.where(interp_variance > 0, 1.0 / interp_variance, 0)
+            sum_inverse_variance += inverse_variance; sum_flux_times_inverse_variance += interp_flux * inverse_variance
+        combined_flux_values = np.zeros_like(common_wave_values, dtype=float); mask_iv = sum_inverse_variance > 0
+        combined_flux_values[mask_iv] = sum_flux_times_inverse_variance[mask_iv] / sum_inverse_variance[mask_iv]
+        combined_variance_values = np.full_like(common_wave_values, np.inf, dtype=float)
+        combined_variance_values[mask_iv] = 1.0 / sum_inverse_variance[mask_iv]
+        combined_err_values = np.sqrt(combined_variance_values)
+        final_1d_spectrum_table = Table([common_wave_values*wave_unit, combined_flux_values*flux_unit, combined_err_values*flux_unit], names=('wave', 'flux', 'err'))
+        if verbose: print(f"Combined {len(valid_pa_spectra)} PA spectra into a single 1D spectrum.")
+
+    if final_1d_spectrum_table is None or len(final_1d_spectrum_table) == 0:
+        if verbose: print(f"No final 1D spectrum available for id={id}. Exiting.")
+        return mb, None, None, pa_spectra_1d, None
+    if verbose and final_1d_spectrum_table is not None:
+        print("\nFinal 1D Spectrum Table (first 5 rows):")
+        final_1d_spectrum_table.show_in_notebook() if hasattr(final_1d_spectrum_table, 'show_in_notebook') else print(final_1d_spectrum_table[:5])
+
+    z_grid_coarse = utils.log_zgrid(zr, dz=dz[0]); chi2_coarse = np.zeros(len(z_grid_coarse))
+    spec_wave = final_1d_spectrum_table['wave'].value; spec_flux = final_1d_spectrum_table['flux'].value
+    spec_err = final_1d_spectrum_table['err'].value; spec_ivar = np.where(spec_err > 0, 1.0 / spec_err**2, 0)
+    NT0 = len(t0); obj_IGM_MINZ = np.maximum(IGM_MINZ, (spec_wave.min() - 200) / 1216.0 - 1)
+    for z_idx, current_z in enumerate(z_grid_coarse):
+        A_1d = np.zeros((len(spec_wave), NT0))
+        for i, temp_key in enumerate(t0):
+            template = t0[temp_key]; igm_factor = 1.0
+            if current_z > obj_IGM_MINZ and IGM is not None:
+                lylim = template.wave < 1250
+                igm_factor = np.ones_like(template.wave); igm_factor[lylim] = IGM.full_IGM(current_z, template.wave[lylim] * (1 + current_z))
+            redshifted_wave = template.wave * (1 + current_z); redshifted_flux = template.flux / (1 + current_z) * igm_factor
+            A_1d[:, i] = np.interp(spec_wave, redshifted_wave, redshifted_flux, left=0, right=0)
+        b_1d_weighted = spec_flux * np.sqrt(spec_ivar); A_1d_weighted = A_1d * np.sqrt(spec_ivar)[:, np.newaxis]
+        try:
+            if fitter_types[0] == 'nnls': coeffs_1d, _ = scipy.optimize.nnls(A_1d_weighted, b_1d_weighted)
+            elif fitter_types[0] == 'lstsq': coeffs_1d, _, _, _ = np.linalg.lstsq(A_1d_weighted, b_1d_weighted, rcond=utils.LSTSQ_RCOND)
+            elif fitter_types[0] == 'bounded':
+                bounds_1d = (np.zeros(NT0), np.ones(NT0) * np.inf)
+                lsq_out = scipy.optimize.lsq_linear(A_1d_weighted, b_1d_weighted, bounds=bounds_1d, **bounded_kwargs); coeffs_1d = lsq_out.x
+            else: coeffs_1d, _ = scipy.optimize.nnls(A_1d_weighted, b_1d_weighted)
+            model_1d_fit = A_1d.dot(coeffs_1d); residuals = spec_flux - model_1d_fit
+            chi2_coarse[z_idx] = np.sum((residuals**2) * spec_ivar)
+        except Exception as e_fit:
+            if verbose: print(f"Fit failed at z={current_z:.4f}: {e_fit}"); chi2_coarse[z_idx] = np.inf
+        if verbose: print(utils.NO_NEWLINE + f"  1D Coarse z={current_z:.4f}, chi2={chi2_coarse[z_idx]:.1f} ({z_idx+1}/{len(z_grid_coarse)})")
+    fit_result_1d = Table([z_grid_coarse, chi2_coarse], names=('zgrid', 'chi2'))
+    mb.DoF = len(final_1d_spectrum_table) - NT0 
+    fit_result_1d = mb._parse_zfit_output(fit_result_1d, prior=prior)
+    if verbose: print(f"\n1D Coarse fit z_map: {fit_result_1d.meta.get('z_map', -1):.4f}")
+
+    z_map_1d = fit_result_1d.meta.get('z_map', z_grid_coarse[np.argmin(chi2_coarse)])
+    NT1 = len(t1); A_t1_1d = np.zeros((len(spec_wave), NT1)); lower_bounds_t1 = np.zeros(NT1); upper_bounds_t1 = np.ones(NT1) * np.inf
+    for i, temp_key in enumerate(t1):
+        template = t1[temp_key]; igm_factor = 1.0
+        if z_map_1d > obj_IGM_MINZ and IGM is not None:
+            lylim = template.wave < 1250
+            igm_factor = np.ones_like(template.wave); igm_factor[lylim] = IGM.full_IGM(z_map_1d, template.wave[lylim] * (1 + z_map_1d))
+        redshifted_wave = template.wave * (1 + z_map_1d); redshifted_flux = template.flux / (1 + z_map_1d) * igm_factor
+        A_t1_1d[:, i] = np.interp(spec_wave, redshifted_wave, redshifted_flux, left=0, right=0)
+        if temp_key.startswith("line "): lower_bounds_t1[i] = LINE_BOUNDS[0]/COEFF_SCALE; upper_bounds_t1[i] = LINE_BOUNDS[1]/COEFF_SCALE
+    b_t1_weighted = spec_flux * np.sqrt(spec_ivar); A_t1_weighted = A_t1_1d * np.sqrt(spec_ivar)[:, np.newaxis]
+    coeffs_t1_1d, covar_t1_1d, chi2_t1 = np.zeros(NT1), np.zeros((NT1,NT1)), np.inf
+    try:
+        if fitter_types[1] == 'nnls': coeffs_t1_1d, _ = scipy.optimize.nnls(A_t1_weighted, b_t1_weighted)
+        elif fitter_types[1] == 'lstsq': coeffs_t1_1d, _, _, _ = np.linalg.lstsq(A_t1_weighted, b_t1_weighted, rcond=utils.LSTSQ_RCOND)
+        elif fitter_types[1] == 'bounded':
+            lsq_out_t1 = scipy.optimize.lsq_linear(A_t1_weighted, b_t1_weighted, bounds=(lower_bounds_t1, upper_bounds_t1), **bounded_kwargs); coeffs_t1_1d = lsq_out_t1.x
+        else: coeffs_t1_1d, _ = scipy.optimize.nnls(A_t1_weighted, b_t1_weighted)
+        try: covar_t1_1d = utils.safe_invert(np.dot(A_t1_weighted.T, A_t1_weighted))
+        except: 
+            if verbose: print("Warning: Covariance calculation failed for 1D template fit.")
+        model_t1_fit = A_t1_1d.dot(coeffs_t1_1d); residuals_t1 = spec_flux - model_t1_fit; chi2_t1 = np.sum((residuals_t1**2) * spec_ivar)
+    except Exception as e_fit_t1:
+        if verbose: print(f"Template fit at z={z_map_1d:.4f} failed: {e_fit_t1}")
+    tfit_1d = OrderedDict(); tfit_1d['coeffs'] = coeffs_t1_1d * COEFF_SCALE; tfit_1d['covar'] = covar_t1_1d * COEFF_SCALE**2
+    tfit_1d['z'] = z_map_1d; tfit_1d['templates'] = t1; tfit_1d['chi2'] = chi2_t1
+    cfit_1d = OrderedDict(); coeffs_err_t1_1d = np.sqrt(np.diag(covar_t1_1d)) * COEFF_SCALE
+    for j, key_j in enumerate(t1): cfit_1d[key_j] = (coeffs_t1_1d[j] * COEFF_SCALE, coeffs_err_t1_1d[j])
+    tfit_1d['cfit'] = cfit_1d
+    cont_coeffs_1d = np.array([cfit_1d[k][0] for k in t1 if not k.startswith('line ')])
+    cont_templates_1d = OrderedDict([(k,v) for k,v in t1.items() if not k.startswith('line ')])
+    if len(cont_templates_1d) > 0:
+         tfit_1d['cont1d'], _ = utils.dot_templates(cont_coeffs_1d / COEFF_SCALE, cont_templates_1d, z=z_map_1d, apply_igm=(z_map_1d > obj_IGM_MINZ))
+    else: tfit_1d['cont1d'] = utils.SpectrumTemplate(wave=spec_wave, flux=np.zeros_like(spec_wave))
+    tfit_1d['line1d'], _ = utils.dot_templates(coeffs_t1_1d / COEFF_SCALE, t1, z=z_map_1d, apply_igm=(z_map_1d > obj_IGM_MINZ))
+    try:
+        tfit_1d['lineEW'] = utils.compute_equivalent_widths(t1, coeffs_t1_1d / COEFF_SCALE, covar_t1_1d / COEFF_SCALE**2, max_R=5000, Ndraw=1000, z=z_map_1d) # Pass unscaled coeffs for EW
+    except Exception as e_ew:
+        if verbose: print(f"Could not compute line EWs: {e_ew}"); tfit_1d['lineEW'] = None
+    if verbose: print(f"\n1D Fit at z={z_map_1d:.4f}, chi2={chi2_t1:.1f}")
+
+    # Prepare HDUs for *.full.fits
+    fit_hdu_1d = pyfits.table_to_hdu(fit_result_1d)
+    fit_hdu_1d.header['EXTNAME'] = 'ZFIT_1D'
+    for key_meta in fit_result_1d.meta: fit_hdu_1d.header[key_meta] = fit_result_1d.meta[key_meta]
+    
+    tfit_sp_1d = utils.GTable()
+    tfit_sp_1d['wave'] = tfit_1d['line1d'].wave
+    tfit_sp_1d['continuum'] = tfit_1d['cont1d'].flux
+    tfit_sp_1d['full'] = tfit_1d['line1d'].flux
+    if hasattr(tfit_1d['line1d'],'waveunits'): tfit_sp_1d['wave'].unit = tfit_1d['line1d'].waveunits
+    if hasattr(tfit_1d['line1d'],'fluxunits'): 
+        tfit_sp_1d['continuum'].unit = tfit_1d['line1d'].fluxunits
+        tfit_sp_1d['full'].unit = tfit_1d['line1d'].fluxunits
+
+    for ik, key_ik in enumerate(tfit_1d['cfit']):
+        tfit_sp_1d.meta[f"CVAL{ik:03d}"] = (tfit_1d['cfit'][key_ik][0], f"Coefficient for {key_ik}")
+        tfit_sp_1d.meta[f"CERR{ik:03d}"] = (tfit_1d['cfit'][key_ik][1], f"Uncertainty for {key_ik}")
+        tfit_sp_1d.meta[f"CNAME{ik:03d}"] = (key_ik, "Template name")
+
+    tfit_hdu_1d = pyfits.table_to_hdu(tfit_sp_1d)
+    tfit_hdu_1d.header['EXTNAME'] = 'TEMPL_1D'
+
+    cov_hdu_1d = pyfits.ImageHDU(data=tfit_1d['covar'], name='COVAR_1D')
+    cov_hdu_1d.header['N'] = tfit_1d['coeffs'].shape[0]
+    if tfit_1d.get('lineEW') is not None:
+        for ik, key_ik in enumerate(tfit_1d['lineEW']):
+            if not key_ik.startswith("line "): continue # only line EWs
+            cov_hdu_1d.header[f"FLUX_{ik:03d}"] = (tfit_1d['cfit'][key_ik][0], f"{key_ik.strip('line ')} line flux")
+            cov_hdu_1d.header[f"ERR_{ik:03d}"]  = (tfit_1d['cfit'][key_ik][1], f"{key_ik.strip('line ')} line uncertainty")
+            cov_hdu_1d.header[f"EW50_{ik:03d}"] = (tfit_1d['lineEW'][key_ik][1], f"Rest-frame {key_ik.strip('line ')} EW, 50th pct")
+            cov_hdu_1d.header[f"EWHW_{ik:03d}"] = ((tfit_1d['lineEW'][key_ik][2] - tfit_1d['lineEW'][key_ik][0])/2, f"Rest-frame {key_ik.strip('line ')} EW, 1-sigma HW")
+            
+    primary_hdu = pyfits.PrimaryHDU()
+    if hasattr(mb, 'h0') and mb.h0 is not None: primary_hdu.header = mb.h0.copy()
+    else: 
+        primary_hdu.header['ID'] = (id, 'Object ID')
+        if hasattr(mb, 'ra'): primary_hdu.header['RA'] = (mb.ra, 'Right Ascension')
+        if hasattr(mb, 'dec'): primary_hdu.header['DEC'] = (mb.dec, 'Declination')
+    primary_hdu.header['GRIZLIV'] = (grizli_version, "Grizli version")
+    primary_hdu.header['FITSTRAT'] = ('stack_p_a_1d', "Fitting strategy")
+
+
+    line_hdul_1d = pyfits.HDUList([primary_hdu, fit_hdu_1d, cov_hdu_1d, tfit_hdu_1d])
+
+    if write_fits_files:
+        full_file_1d = f"{group_name}_{id:05d}.full.fits" 
+        line_hdul_1d.writeto(full_file_1d, overwrite=True, output_verify='fix')
+        if verbose: print(f"Saved 1D full fit to {full_file_1d}")
+        try:
+            summary_info = summary.summary_catalog(dzbin=None, filter_bandpasses=[], files=[full_file_1d])
+            if summary_info is not None and len(summary_info) > 0:
+                summary_info["grizli_version"] = grizli_version
+                row_file_1d = f"{group_name}_{id:05d}.row.fits"
+                summary_info.write(row_file_1d, overwrite=True)
+                if verbose: print(f"Saved 1D summary row to {row_file_1d}")
+        except Exception as e_sum:
+            if verbose: print(f"Failed to generate/save summary row: {e_sum}")
+
+    if final_1d_spectrum_table is not None and write_fits_files:
+        oned_hdu = pyfits.BinTableHDU(data=final_1d_spectrum_table, name='SPEC1D')
+        # Re-create primary HDU for this specific file to avoid header conflicts from line_hdul_1d
+        oned_primary_hdu = pyfits.PrimaryHDU()
+        if hasattr(mb, 'h0') and mb.h0 is not None: oned_primary_hdu.header = mb.h0.copy()
+        else: 
+            oned_primary_hdu.header['ID'] = (id, 'Object ID')
+            if hasattr(mb, 'ra'): oned_primary_hdu.header['RA'] = (mb.ra, 'Right Ascension')
+            if hasattr(mb, 'dec'): oned_primary_hdu.header['DEC'] = (mb.dec, 'Declination')
+        oned_primary_hdu.header['GRIZLIV'] = (grizli_version, "Grizli version")
+        oned_primary_hdu.header['FITSTRAT'] = ('stack_p_a_1d', "Fitting strategy")
+
+        oned_hdul = pyfits.HDUList([oned_primary_hdu, oned_hdu])
+        oned_filename = f"{group_name}_{id:05d}.1D.fits"
+        oned_hdul.writeto(oned_filename, overwrite=True, output_verify='fix')
+        if verbose: print(f"Saved final 1D spectrum to {oned_filename}")
+
+    if save_figures and verbose:
+        if fit_result_1d and tfit_1d and final_1d_spectrum_table is not None:
+            _make_1d_fit_plot(final_1d_spectrum_table, fit_result_1d, tfit_1d, 
+                              group_name, id, fig_type=fig_type, save_figures=save_figures)
+        else:
+            print("Skipping 1D diagnostic plot for 'stack_p_a_1d' as fit components are missing.")
+
+    return mb, fit_result_1d, tfit_1d, pa_spectra_1d, line_hdul_1d
+
+
+def _make_1d_fit_plot(final_1d_spec_table, fit_result_1d, tfit_1d, 
+                        group_name, object_id, fig_type='png', save_figures=True):
+    """
+    Generate a diagnostic plot for the 1D combined spectrum fit.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.gridspec
+    import numpy as np
+    from . import utils # For GRISM_COLORS if needed, and SpectrumTemplate properties
+
+    if not save_figures:
+        return
+
+    fig = plt.figure(figsize=[8, 3.5])
+    gs = matplotlib.gridspec.GridSpec(1, 2, width_ratios=[1, 1.5], hspace=0.0)
+
+    # --- p(z) plot ---
+    ax_pz = fig.add_subplot(gs[0])
+    if fit_result_1d is not None and 'zgrid' in fit_result_1d.colnames and 'pdf' in fit_result_1d.colnames:
+        z_map = fit_result_1d.meta.get('z_map', -1)
+        chi2_min = fit_result_1d.meta.get('CHIMIN', np.nan)
+        dof = fit_result_1d.meta.get('DOF', 1)
+        
+        label = (f"{group_name}\nID={object_id:<5d}  z={z_map:.4f}\n"
+                 f"$\\chi^2/DoF = {chi2_min:.1f}/{dof:.0f} = {chi2_min/dof:.2f}$")
+        ax_pz.text(0.95, 0.96, label, ha='right', va='top', transform=ax_pz.transAxes, fontsize=7)
+
+        zmi, zma = fit_result_1d["zgrid"].min(), fit_result_1d["zgrid"].max()
+        if (zma - zmi) > 5 : # Log scale for large z range
+            ticks = np.arange(np.ceil(zmi), np.floor(zma) + 0.5, 1)
+            lz = np.log(1 + fit_result_1d["zgrid"])
+            ax_pz.plot(lz, np.log10(fit_result_1d["pdf"]), color="k")
+            ax_pz.set_xticks(np.log(1 + ticks))
+            ax_pz.set_xticklabels(np.asarray(ticks, dtype=int))
+            ax_pz.set_xlim(lz.min(), lz.max())
+            if z_map > 0: ax_pz.axvline(np.log(1+z_map), color='r', linestyle='--', alpha=0.7)
+        else:
+            ax_pz.plot(fit_result_1d["zgrid"], np.log10(fit_result_1d["pdf"]), color="k")
+            ax_pz.set_xlim(zmi, zma)
+            if z_map > 0: ax_pz.axvline(z_map, color='r', linestyle='--', alpha=0.7)
+
+        ax_pz.set_xlabel(r"$z$")
+        ax_pz.set_ylabel(r"$\log\ p(z)$")
+        pzmax = np.log10(fit_result_1d["pdf"].max())
+        ax_pz.set_ylim(pzmax - 6, pzmax + 0.9)
+        ax_pz.grid()
+    else:
+        ax_pz.text(0.5, 0.5, "p(z) data not available", ha='center', va='center', transform=ax_pz.transAxes)
+
+    # --- Spectrum plot ---
+    ax_spec = fig.add_subplot(gs[1])
+    if final_1d_spectrum_table is not None:
+        wave_obs = final_1d_spectrum_table['wave'].value
+        flux_obs = final_1d_spectrum_table['flux'].value
+        err_obs = final_1d_spectrum_table['err'].value
+        
+        # Basic plot of observed spectrum
+        ax_spec.errorbar(wave_obs, flux_obs, yerr=err_obs, fmt='.', color='k', ecolor='0.7', alpha=0.6, label="Data (Stacked 1D)")
+
+        if tfit_1d and 'line1d' in tfit_1d and 'cont1d' in tfit_1d:
+            model_wave = tfit_1d['line1d'].wave
+            model_flux = tfit_1d['line1d'].flux
+            cont_flux = tfit_1d['cont1d'].flux
+            
+            ax_spec.plot(model_wave, model_flux, color='r', alpha=0.8, label="Model (Line+Cont)")
+            ax_spec.plot(model_wave, cont_flux, color='orange', linestyle='--', alpha=0.7, label="Continuum")
+
+        ax_spec.set_xlabel(f"Wavelength [{final_1d_spectrum_table['wave'].unit}]" if final_1d_spectrum_table['wave'].unit else "Wavelength")
+        ax_spec.set_ylabel(f"Flux [{final_1d_spectrum_table['flux'].unit}]" if final_1d_spectrum_table['flux'].unit else "Flux")
+        
+        # Determine y-limits robustly
+        valid_flux = flux_obs[np.isfinite(flux_obs) & (err_obs > 0) & np.isfinite(err_obs)]
+        if len(valid_flux) > 0:
+            ymin, ymax = np.percentile(valid_flux, [2, 98])
+            yrange = ymax - ymin
+            ax_spec.set_ylim(ymin - 0.1 * yrange, ymax + 0.1 * yrange)
+        
+        ax_spec.grid()
+        ax_spec.legend(fontsize=8)
+    else:
+        ax_spec.text(0.5,0.5, "1D Spectrum not available", ha='center', va='center', transform=ax_spec.transAxes)
+        
+    fig.tight_layout(pad=0.5)
+    
+    if save_figures:
+        plot_filename = "{0}_{1:05d}.1Dfit.{2}".format(group_name, object_id, fig_type)
+        fig.savefig(plot_filename)
+        plt.close(fig)
+        if kwargs.get('verbose', True):
+            print(f"Saved 1D diagnostic plot to {plot_filename}")
+
 def run_all(
     id,
     t0=None,
@@ -197,6 +612,11 @@ def run_all(
     diff2d=True,
     **kwargs,
 ):
+    # Capture all arguments to pass to _run_all_stack_p_a_1d
+    current_kwargs = locals().copy()
+
+    if current_kwargs.get('fit_strategy') == 'stack_p_a_1d':
+        return _run_all_stack_p_a_1d(id, **current_kwargs)
 
     """Run the full template-fitting procedure
 
