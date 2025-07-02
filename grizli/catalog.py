@@ -755,26 +755,28 @@ def gaia_catalog_for_assoc(assoc_name="j191132p1652_hen-2-427-f335m_00007", min_
     """
     from grizli.aws import db
     from grizli import utils
+    # TN comment: this is a hack to get the GAIA catalog for a given association
+    # res = db.SQL(
+    #     f"""select t_min, t_max, filter, footprint
+    # from assoc_table where assoc_name = '{assoc_name}'
+    # """
+    # )
 
-    res = db.SQL(
-        f"""select t_min, t_max, filter, footprint
-    from assoc_table where assoc_name = '{assoc_name}'
-    """
-    )
+    # sr = utils.SRegion(res["footprint"][0])
+    # for fp in res["footprint"][1:]:
+    #     sri = utils.SRegion(fp)
+    #     sr.xy.extend(sri.xy)
 
-    sr = utils.SRegion(res["footprint"][0])
-    for fp in res["footprint"][1:]:
-        sri = utils.SRegion(fp)
-        sr.xy.extend(sri.xy)
+    # un = sr.union()
+    # radius = np.maximum(np.sqrt(un.sky_area()[0]).value, min_radius)
 
-    un = sr.union()
-    radius = np.maximum(np.sqrt(un.sky_area()[0]).value, min_radius)
+    # ra_center, de_center = un.centroid[0]
 
-    ra_center, de_center = un.centroid[0]
+    ra_center, de_center, radius = kwargs['ra_for_gaia'],   kwargs['dec_for_gaia'], kwargs['radius_for_gaia']
 
     gaia = get_gaia_vizier(ra_center, de_center, radius=radius, **kwargs)
 
-    rd = get_gaia_radec_at_time(gaia, np.mean(res["t_min"]), format="mjd")
+    rd = get_gaia_radec_at_time(gaia, kwargs['mjd_for_gaia'], format="mjd")
 
     gaia["ra_orig"] = gaia["ra"]
     gaia["de_orig"] = gaia["dec"]
@@ -782,7 +784,8 @@ def gaia_catalog_for_assoc(assoc_name="j191132p1652_hen-2-427-f335m_00007", min_
     gaia["dec"] = rd.dec.deg
 
     coo = np.array([gaia["ra"], gaia["dec"]])
-    in_footprint = un.path[0].contains_points(coo.T)
+    # in_footprint = un.path[0].contains_points(coo.T)
+    in_footprint = True
     gaia["in_assoc"] = in_footprint
 
     gaia.meta["assocnam"] = assoc_name

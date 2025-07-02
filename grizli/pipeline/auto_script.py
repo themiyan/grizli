@@ -476,7 +476,7 @@ def go(root='j010311+131615',
     # Preliminary gaia catalog
     # Get gaia catalog
     try:
-        gaia = grizli_catalog.gaia_catalog_for_assoc(assoc_name=root)
+        gaia = grizli_catalog.gaia_catalog_for_assoc(assoc_name=root, **kwargs)
         msg = f"{root} : found {gaia['valid'].sum()} GAIA sources"
         utils.log_comment(utils.LOGFILE, msg, show_date=False,
                           verbose=True)
@@ -3799,7 +3799,7 @@ def extract(field_root='j142724+334246', maglim=[13, 24], prior=None, MW_EBV=0.0
 
     # Use "binning" templates for standardized extraction
     if oned_R:
-        bin_steps, step_templ = utils.step_templates(wlim=[5000, 18000.0],
+        bin_steps, step_templ = utils.step_templates(wlim=[5000, 58000.0],
                                                      R=oned_R, round=10)
         init_templates = step_templ
     else:
@@ -3886,7 +3886,12 @@ def extract(field_root='j142724+334246', maglim=[13, 24], prior=None, MW_EBV=0.0
         except:
             continue
 
-        hdu, fig = mb.drizzle_grisms_and_PAs(fcontam=0.5, flambda=False, kernel='point', size=32, tfit=tfit, diff=diff)
+        try:
+            hdu, fig = mb.drizzle_grisms_and_PAs(fcontam=0.5, flambda=False, kernel='point', size=32, tfit=tfit, diff=diff)
+        except:
+            print('Error in drizzle_grisms_and_PAs for {0}_{1:05d}'.format(target, id))
+            continue
+        
         fig.savefig('{0}_{1:05d}.stack.png'.format(target, id))
 
         hdu.writeto('{0}_{1:05d}.stack.fits'.format(target, id),
@@ -4113,7 +4118,7 @@ def fine_alignment(field_root='j142724+334246', HOME_PATH='/Volumes/Pegasus/Griz
             utils.log_comment(utils.LOGFILE, msg, show_date=True,
                               verbose=True)
                           
-            gaia_tab = prep.get_gaia_DR2_vizier(ra=ra_i, dec=dec_i, 
+            gaia_tab = prep.get_gaia_vizier(ra=ra_i, dec=dec_i, 
                                                 radius=drad)
         
         # Done
@@ -4240,8 +4245,9 @@ def fine_alignment(field_root='j142724+334246', HOME_PATH='/Volumes/Pegasus/Griz
     plotx_args = (tab, ref_tab, ref_err, shift_only, 'plotx')
 
     pi = p0*1.  # *10.
+
     for iter in range(NITER):
-        fit = minimize(_objfun_align, pi*pscl, args=fit_args, method=method, jac=None, hess=None, hessp=None, bounds=None, constraints=(), tol=tol, callback=None, options=fit_options)
+        fit = minimize(_objfun_align, (pi*pscl).flatten(), args=fit_args, method=method, jac=None, hess=None, hessp=None, bounds=None, constraints=(), tol=tol, callback=None, options=fit_options)
         pi = fit.x.reshape((-1, len(pscl)))/pscl
 
     ########

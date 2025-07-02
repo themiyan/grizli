@@ -4474,7 +4474,7 @@ class GrismFLT(object):
             msg = f"NIRCam: apply POM geometry from {pom_file}"
             utils.log_comment(utils.LOGFILE, msg, verbose=verbose)
 
-        pom = pyfits.open(pom_file)[-1]
+        pom = pyfits.open(pom_file)[1]
         pomh = pom.header
 
         if self.grism.pupil.lower() == "grismc":
