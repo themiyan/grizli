@@ -18,6 +18,10 @@ from astropy.table import Table
 import astropy.wcs as pywcs
 import astropy.units as u
 
+from multiprocessing import Pool
+from .mp_utils import _compute_partial_model
+
+
 # import stwcs
 
 # Helper functions from a document written by Pirzkal, Brammer & Ryan
@@ -3730,6 +3734,8 @@ class GrismFLT(object):
         size=10,
         min_size=26,
         compute_size=True,
+        n_processes=1,
+        chunk_size=None,
     ):
         """
         Compute flat-spectrum model for multiple objects.
@@ -3764,6 +3770,14 @@ class GrismFLT(object):
         min_size : int
             Minimum size of the cutout to extract.  This is enforced when
             `compute_size` is True.
+
+        n_processes : int
+            Number of processes to use for parallel computation. If 1, the
+            computation is run serially.
+
+        chunk_size : int or None
+            The size of chunks of object IDs to be processed by each worker.
+            If None, it's determined automatically.
 
         Returns
         -------
@@ -3813,21 +3827,83 @@ class GrismFLT(object):
                     raise ValueError("`ids` and `mags` lists different sizes")
 
         # Now compute the full model
-        if verbose & has_tqdm:
-            iterator = tqdm(zip(ids, mags))
-        else:
-            iterator = zip(ids, mags)
+        if n_processes == 1:
+            if verbose & has_tqdm:
+                iterator = tqdm(zip(ids, mags))
+            else:
+                iterator = zip(ids, mags)
 
-        for id_i, mag_i in iterator:
-            self.compute_model_orders(
-                id=id_i,
-                compute_size=compute_size,
-                mag=mag_i,
-                size=size,
-                in_place=True,
-                store=store,
-                min_size=min_size,
-            )
+            for id_i, mag_i in iterator:
+                self.compute_model_orders(
+                    id=id_i,
+                    compute_size=compute_size,
+                    mag=mag_i,
+                    size=size,
+                    in_place=True,
+                    store=store,
+                    min_size=min_size,
+                )
+            return
+
+        # --- parallel path ---
+        n_procs = min(max(1, n_processes), len(ids))
+        if not chunk_size:
+            # Target ~0.5–2s per chunk; start simple and tune
+            chunk_size = max(256, len(ids) // (4 * n_procs) or 1)
+
+        # Build chunks
+        order = np.arange(len(ids))
+        chunks = [order[i:i + chunk_size] for i in range(0, len(order), chunk_size)]
+
+        # Reconstructable constructor kwargs (mirror how this instance was made)
+        flt_ctor_kwargs = dict(
+            grism_file=self.grism_file,
+            direct_file=self.direct_file,
+            seg_file=self.seg_file,
+            ref_file=self.ref_file,
+            pad=self.pad,
+            use_jwst_crds=self.use_jwst_crds,
+            shrink_segimage=True,  # safe default
+            verbose=False
+        )
+
+        tasks = []
+        for ch in chunks:
+            tasks.append((
+                flt_ctor_kwargs,
+                [ids[i] for i in ch],
+                [mags[i] for i in ch],
+                size, min_size, compute_size, store
+            ))
+
+        # Dispatch
+        results = []
+        with Pool(processes=n_procs) as pool:
+            if verbose & has_tqdm:
+                pbar = tqdm(total=len(tasks), desc='Parallel full model')
+
+            for res in pool.imap_unordered(_compute_partial_model, tasks, chunksize=1):
+                results.append(res)
+                if verbose & has_tqdm:
+                    pbar.update(1)
+
+            if verbose & has_tqdm:
+                pbar.close()
+
+        # Aggregate
+        full = np.zeros_like(self.model, dtype=np.float32)
+        if store:
+            # ensure OrderedDict exists
+            self.object_dispersers = type(self.object_dispersers)()
+
+        for res in results:
+            if store:
+                partial, disp = res
+                full += partial
+                self.object_dispersers.update(disp)
+            else:
+                full += res
+        self.model = full
 
     def smooth_mask(self, gaussian_width=4, threshold=2.5):
         """
