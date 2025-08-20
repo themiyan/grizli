@@ -456,8 +456,17 @@ class GrismDisperser(object):
         self.x0 -= 1  # zero index!
 
         self.dxpix = self.dx - self.dx[0] + self.x0[1]  # + 1
+        
+        # Add bounds checking to prevent IndexError with NIRISS configurations
+        y_indices = dyc + self.x0[0]
+        x_indices = self.dxpix
+        
+        # Clip indices to valid array bounds
+        y_indices = np.clip(y_indices, 0, self.sh_beam[0] - 1)
+        x_indices = np.clip(x_indices, 0, self.sh_beam[1] - 1)
+        
         try:
-            self.flat_index = self.idx[dyc + self.x0[0], self.dxpix]
+            self.flat_index = self.idx[y_indices, x_indices]
         except IndexError:
             # print('Index Error', id, dyc.dtype, self.dxpix.dtype, self.x0[0], self.xc, self.yc, self.beam, self.ytrace_beam.max(), self.ytrace_beam.min())
             raise IndexError
@@ -536,8 +545,16 @@ class GrismDisperser(object):
         # Account for pixel centering of the trace
         self.yfrac_beam = self.ytrace_beam - np.floor(self.ytrace_beam)
 
+        # Add bounds checking to prevent IndexError with NIRISS configurations
+        y_indices = dyc + self.x0[0]
+        x_indices = self.dxpix
+        
+        # Clip indices to valid array bounds
+        y_indices = np.clip(y_indices, 0, self.sh_beam[0] - 1)
+        x_indices = np.clip(x_indices, 0, self.sh_beam[1] - 1)
+
         try:
-            self.flat_index = self.idx[dyc + self.x0[0], self.dxpix]
+            self.flat_index = self.idx[y_indices, x_indices]
         except IndexError:
             # print 'Index Error', id, self.x0[0], self.xc, self.yc, self.beam, self.ytrace_beam.max(), self.ytrace_beam.min()
             raise IndexError
